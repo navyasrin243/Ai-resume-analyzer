@@ -1,174 +1,357 @@
 import os
-import tempfile
-import streamlit as st
-from ingest import ingest_resume
-from analyzer import analyze
+import re
+import json
+from typing import List, Dict
 
-st.set_page_config(
-    page_title="AI Resume Analyzer",
-    page_icon="🚀",
-    layout="wide",
-)
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from pydantic import BaseModel, Field
 
-st.markdown("""
-<style>
-.main-title{font-size:2.2rem;font-weight:bold;
-            text-align:center;color:#1f77b4;}
-</style>""", unsafe_allow_html=True)
+load_dotenv()
 
-st.markdown('<p class="main-title">🚀 AI Resume Analyzer</p>',
-            unsafe_allow_html=True)
-st.markdown("##### Upload Resume + Paste JD → Instant AI Analysis!")
-st.divider()
 
-# ── Session state (per user, never shared) ────────────────────────────────────
-for key in ("file_key", "vectorstore", "resume_text", "chunks"):
-    if key not in st.session_state:
-        st.session_state[key] = None
-
-# ── Inputs ────────────────────────────────────────────────────────────────────
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("📄 Upload Resume")
-    uploaded_file = st.file_uploader("PDF only", type=["pdf"])
-with col2:
-    st.subheader("💼 Job Description")
-    jd_text = st.text_area(
-        "Paste JD here", height=200,
-        placeholder="We are looking for an AI Engineer with Python, ML...",
+# ── Output model ──────────────────────────────────────────────────────────────
+class AnalysisResult(BaseModel):
+    match_score:         int            = Field(description="Score 0-100")
+    matched_skills:      List[str]      = Field(description="Matched skills")
+    missing_skills:      List[str]      = Field(description="Missing skills")
+    partial_skills:      List[str]      = Field(description="Partial skills")
+    explanation:         str            = Field(description="Explanation")
+    resume_tips:         List[str]      = Field(description="Resume tips")
+    cover_letter:        str            = Field(description="Cover letter")
+    interview_questions: List[str]      = Field(description="Interview Qs")
+    evidence:            Dict[str, str] = Field(
+        default_factory=dict,
+        description="Resume snippet backing each found skill"
     )
 
-st.divider()
-btn = st.button("🔍 Analyze Resume", type="primary", use_container_width=True)
 
-# ── Analysis ──────────────────────────────────────────────────────────────────
-if btn:
-    if not uploaded_file:
-        st.error("❌ Upload resume PDF!")
-    elif not jd_text.strip():
-        st.error("❌ Paste Job Description!")
+def get_llm():
+    return ChatGroq(
+        model="qwen/qwen3.8-27b",  # Better JSON compliance
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0.3,
+    )
+
+
+# ── Skill aliases ─────────────────────────────────────────────────────────────
+ALIASES = {
+    "machine learning": ["machine learning", "ml"],
+    "deep learning":    ["deep learning", "dl"],
+    "nlp":              ["nlp", "natural language processing"],
+    "power bi":         ["power bi", "powerbi"],
+    "scikit-learn":     ["scikit-learn", "scikit learn", "sklearn"],
+    "tensorflow":       ["tensorflow", "tf"],
+    "data analysis":    ["data analysis", "data analytics"],
+    "eda":              ["eda", "exploratory data analysis"],
+    "git":              ["git", "github", "gitlab"],
+    "github":           ["github"],
+    "sql":              ["sql", "mysql", "postgresql", "sqlite"],
+    "python":           ["python"],
+    "java":             ["java"],
+    "javascript":       ["javascript", "js"],
+    "html5":            ["html5", "html"],
+    "css3":             ["css3", "css"],
+    "react":            ["react", "react.js", "reactjs"],
+    "node.js":          ["node.js", "nodejs", "node"],
+    "aws":              ["aws", "amazon web services"],
+    "docker":           ["docker"],
+    "tableau":          ["tableau"],
+    "mongodb":          ["mongodb"],
+    "pytorch":          ["pytorch", "torch"],
+    "langchain":        ["langchain", "lang chain"],
+    "rag":              ["rag", "retrieval augmented", "retrieval-augmented"],
+    "chromadb":         ["chromadb", "chroma"],
+    "streamlit":        ["streamlit"],
+    "fastapi":          ["fastapi", "fast api"],
+}
+
+GENERIC_WORDS = {
+    "data", "analysis", "analytics", "learning", "development", "developer",
+    "engineering", "engineer", "design", "management", "software", "tools",
+    "tool", "systems", "system", "skills", "experience", "knowledge",
+    "programming", "framework", "frameworks", "application", "applications",
+    "cloud", "web", "testing", "model", "models", "modeling",
+}
+
+
+def has_term(term: str, text: str) -> bool:
+    pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+    return re.search(pattern, text) is not None
+
+
+# ── Robust JSON extractor ─────────────────────────────────────────────────────
+def _extract_json(raw: str, kind: str):
+    """
+    Robustly extract JSON array or object from LLM response.
+    Handles: markdown fences, extra text, nested content.
+    """
+    if not raw or not raw.strip():
+        raise ValueError("Empty response from model.")
+
+    # Remove markdown fences
+    text = re.sub(r"```json\s*", "", raw, flags=re.IGNORECASE)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+
+    if kind == "[":
+        start = text.find("[")
+        end   = text.rfind("]") + 1
     else:
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+
+    if start == -1 or end <= start:
+        raise ValueError(f"No JSON {kind} found in model reply:\n{raw[:300]}")
+
+    json_str = text[start:end]
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
         try:
-            # Phase 1: ingest only when the uploaded file actually changed
-            file_bytes = uploaded_file.getvalue()
-            file_key = f"{uploaded_file.name}-{len(file_bytes)}"
+            return json.loads(json_str, strict=False)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}\nContent: {json_str[:200]}")
 
-            if file_key != st.session_state.file_key:
-                tmp_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                        tmp.write(file_bytes)
-                        tmp_path = tmp.name
-                    with st.spinner("📄 Processing resume..."):
-                        vs, text, n = ingest_resume(tmp_path)
-                finally:
-                    if tmp_path:
-                        try:
-                            os.unlink(tmp_path)
-                        except OSError:
-                            pass
-                st.session_state.vectorstore = vs
-                st.session_state.resume_text = text
-                st.session_state.chunks = n
-                st.session_state.file_key = file_key
 
-            st.success(
-                f"✅ {st.session_state.chunks} chunks indexed "
-                f"({len(st.session_state.resume_text)} characters read)"
-            )
+# ── Extract JD skills ─────────────────────────────────────────────────────────
+def extract_jd_skills(jd_text: str, llm) -> List[Dict]:
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """Extract EVERY technical skill, tool, language, framework,
+platform and domain requirement from the job description.
 
-            # Phase 2: analyze
-            with st.spinner("🤖 Analyzing... (20-30 sec)"):
-                result = analyze(
-                    jd_text,
-                    st.session_state.resume_text,
-                    st.session_state.vectorstore,
-                )
+Return ONLY a JSON array. No markdown. No explanation.
+First character must be [ and last must be ].
 
-            st.divider()
-            st.subheader("📊 Analysis Results")
+Example:
+[{{"skill": "Python", "type": "required"}}, {{"skill": "AWS", "type": "preferred"}}]"""),
+        ("human", "Job Description:\n{jd}"),
+    ])
 
-            # ── Score ─────────────────────────────────────────────────────────
-            score = result.match_score
-            color = "#d4edda" if score >= 75 else "#fff3cd" if score >= 50 else "#f8d7da"
-            tcolor = "#155724" if score >= 75 else "#856404" if score >= 50 else "#721c24"
-            emoji = "🟢" if score >= 75 else "🟡" if score >= 50 else "🔴"
+    chain = prompt | llm | StrOutputParser()
 
-            st.markdown(f"""
-            <div style="background:{color};color:{tcolor};
-                        font-size:2.2rem;font-weight:bold;
-                        text-align:center;padding:18px;
-                        border-radius:10px;margin:10px 0;">
-                {emoji} Match Score: {score}/100
-            </div>""", unsafe_allow_html=True)
-
-            st.info(f"💡 {result.explanation}")
-            st.divider()
-
-            # ── Skills Grid ───────────────────────────────────────────────────
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown("### ✅ Matched")
-                if result.matched_skills:
-                    for s in result.matched_skills:
-                        st.success(f"✅ {s}")
+    for attempt in range(2):
+        try:
+            raw = chain.invoke({"jd": jd_text[:4000]})
+            items = _extract_json(raw, "[")
+            skills, seen = [], set()
+            for it in items:
+                if isinstance(it, str):
+                    name, required = it.strip(), True
+                elif isinstance(it, dict):
+                    name     = str(it.get("skill", "")).strip()
+                    required = str(it.get("type", "required")).lower() != "preferred"
                 else:
-                    st.info("None")
-            with c2:
-                st.markdown("### ❌ Missing")
-                if result.missing_skills:
-                    for s in result.missing_skills:
-                        st.error(f"❌ {s}")
-                else:
-                    st.info("None! 🎉")
-            with c3:
-                st.markdown("### ⚠️ Partial")
-                if result.partial_skills:
-                    for s in result.partial_skills:
-                        st.warning(f"⚠️ {s}")
-                else:
-                    st.info("None!")
+                    continue
+                if name and name.lower() not in seen:
+                    seen.add(name.lower())
+                    skills.append({"skill": name, "required": required})
+            if skills:
+                return skills[:30]
+            raise ValueError("No skills found.")
+        except Exception as e:
+            print(f"  Skill extraction attempt {attempt+1} failed: {e}")
+            if attempt == 1:
+                raise ValueError(f"Could not extract JD skills: {e}")
 
-            # ── Evidence (RAG) ────────────────────────────────────────────────
-            if result.evidence:
-                with st.expander("🔎 Where these skills appear in your resume"):
-                    for skill, snippet in result.evidence.items():
-                        st.markdown(f"**{skill}** — _{snippet}_")
+    raise ValueError("Skill extraction failed.")
 
-            st.divider()
 
-            # ── Resume Tips ───────────────────────────────────────────────────
-            st.subheader("📝 Resume Tips")
-            for i, tip in enumerate(result.resume_tips, 1):
-                st.info(f"**Tip {i}:** {tip}")
+# ── Skill matching ─────────────────────────────────────────────────────────────
+def calculate_skill_match(skills: List[Dict], resume_full_text: str) -> Dict:
+    text = re.sub(r"\s+", " ", resume_full_text.lower())
+    matched, missing, partial = [], [], []
+    earned, total = 0.0, 0.0
 
-            st.divider()
+    for item in skills:
+        skill  = item["skill"]
+        weight = 1.0 if item["required"] else 0.5
+        key    = skill.lower().strip()
+        terms  = ALIASES.get(key, [key])
+        total += weight
 
-            # ── Interview Questions ───────────────────────────────────────────
-            st.subheader("🎯 Interview Questions")
-            for i, q in enumerate(result.interview_questions, 1):
-                st.markdown(f"**Q{i}.** {q}")
+        if any(has_term(t, text) for t in terms):
+            matched.append(skill)
+            earned += weight
+            continue
 
-            st.divider()
+        words = [
+            w for w in re.split(r"[\s/,-]+", key)
+            if len(w) >= 4 and w not in GENERIC_WORDS
+        ]
+        if len(key.split()) > 1 and words and any(has_term(w, text) for w in words):
+            partial.append(skill)
+            earned += weight * 0.5
+        else:
+            missing.append(skill)
 
-            # ── Cover Letter ──────────────────────────────────────────────────
-            st.subheader("✉️ Cover Letter")
-            st.text_area("Copy:", value=result.cover_letter, height=250)
-            st.download_button(
-                "⬇️ Download Cover Letter",
-                data=result.cover_letter,
-                file_name="cover_letter.txt",
-                mime="text/plain",
-            )
+    score = int(round(earned / total * 100)) if total else 0
+    return {"matched": matched, "partial": partial, "missing": missing, "score": score}
+
+
+# ── RAG evidence ──────────────────────────────────────────────────────────────
+def get_evidence(vectorstore, skills: List[str], limit: int = 8) -> Dict[str, str]:
+    evidence = {}
+    for skill in skills[:limit]:
+        try:
+            docs = vectorstore.similarity_search(skill, k=1)
+            if docs:
+                snippet = re.sub(r"\s+", " ", docs[0].page_content).strip()
+                evidence[skill] = snippet[:220]
+        except Exception as e:
+            print(f"Evidence lookup failed for {skill}: {e}")
+    return evidence
+
+
+# ── LLM analysis ─────────────────────────────────────────────────────────────
+def generate_analysis(jd_text: str, skills: List[Dict], sm: Dict, llm) -> Dict:
+    status = "\n".join(
+        f"- {s['skill']} ({'required' if s['required'] else 'preferred'}): "
+        + ("FOUND"   if s["skill"] in sm["matched"]
+           else "PARTIAL" if s["skill"] in sm["partial"]
+           else "MISSING")
+        for s in skills
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a senior HR analyst and career coach.
+You MUST return ONLY a raw JSON object.
+No introduction. No explanation. No markdown.
+First character MUST be {{ and last MUST be }}.
+
+Exact structure required:
+{{
+  "explanation": "2 sentences about why the candidate matches or doesn't match",
+  "resume_tips": [
+    "Specific tip 1 to improve resume",
+    "Specific tip 2 to improve resume",
+    "Specific tip 3 to improve resume"
+  ],
+  "cover_letter": "Professional cover letter of 150 words",
+  "interview_questions": [
+    "Question 1 likely to be asked",
+    "Question 2 likely to be asked",
+    "Question 3 likely to be asked",
+    "Question 4 likely to be asked",
+    "Question 5 likely to be asked"
+  ]
+}}
+
+IMPORTANT:
+- resume_tips MUST be a list of 3 strings
+- interview_questions MUST be a list of 5 strings
+- Both must be actual content, not empty"""),
+        ("human", """Job Description:
+{jd}
+
+Match Score: {score}/100
+Matched: {matched}
+Missing: {missing}
+
+Skill Status:
+{status}
+
+Return JSON only:"""),
+    ])
+
+    chain = prompt | llm | StrOutputParser()
+
+    for attempt in range(2):
+        try:
+            raw = chain.invoke({
+                "jd":      jd_text[:1500],
+                "score":   sm["score"],
+                "matched": sm["matched"],
+                "missing": sm["missing"],
+                "status":  status,
+            })
+            data = _extract_json(raw, "{")
+
+            # Validate lists are actually lists with content
+            if not isinstance(data.get("resume_tips"), list) or \
+               len(data.get("resume_tips", [])) == 0:
+                raise ValueError("resume_tips missing or empty")
+
+            if not isinstance(data.get("interview_questions"), list) or \
+               len(data.get("interview_questions", [])) == 0:
+                raise ValueError("interview_questions missing or empty")
+
+            return data
 
         except Exception as e:
-            st.error(f"❌ {str(e)}")
-            st.info("💡 Check your inputs and try again.")
+            print(f"  Analysis attempt {attempt+1} failed: {e}")
+            if attempt == 1:
+                # Fallback — never return empty
+                return {
+                    "explanation": (
+                        f"Your resume matches {sm['score']}% of the job requirements. "
+                        f"You have {len(sm['matched'])} matching skills and "
+                        f"{len(sm['missing'])} skills to develop."
+                    ),
+                    "resume_tips": [
+                        f"Add missing skills to your resume: {', '.join(sm['missing'][:3])}",
+                        "Quantify your achievements with specific numbers and metrics.",
+                        "Highlight relevant tools and technologies prominently in skills section."
+                    ],
+                    "cover_letter": (
+                        f"Dear Hiring Manager,\n\n"
+                        f"I am writing to express my interest in this role. "
+                        f"With my background in {', '.join(sm['matched'][:3])}, "
+                        f"I am confident in my ability to contribute effectively. "
+                        f"I am eager to bring my skills and passion to your team.\n\n"
+                        f"Best regards"
+                    ),
+                    "interview_questions": [
+                        "Tell me about yourself and your relevant experience.",
+                        f"How have you used {sm['matched'][0] if sm['matched'] else 'your skills'} in a project?",
+                        "Describe a challenging problem you solved recently.",
+                        "How do you stay updated with the latest technology trends?",
+                        "Where do you see yourself in 5 years?"
+                    ]
+                }
 
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.divider()
-st.markdown(
-    "<center>Built with ❤️ LangChain + ChromaDB + "
-    "Groq + Streamlit | Navyasri Akula</center>",
-    unsafe_allow_html=True,
-)
+
+# ── Main entry point ──────────────────────────────────────────────────────────
+def analyze(jd_text: str, resume_text: str, vectorstore=None) -> AnalysisResult:
+
+    if not resume_text or not resume_text.strip():
+        raise ValueError("Resume text is empty. Upload a resume first.")
+    if not jd_text or not jd_text.strip():
+        raise ValueError("Job description is empty.")
+
+    llm = get_llm()
+
+    # Step 1: Extract JD skills
+    print("\n🔍 Extracting JD skills...")
+    skills = extract_jd_skills(jd_text, llm)
+    print(f"✅ Found {len(skills)} skills")
+
+    # Step 2: Rule-based matching
+    print("\n📊 Matching skills...")
+    sm = calculate_skill_match(skills, resume_text)
+    print(f"✅ Score: {sm['score']}/100")
+
+    # Step 3: RAG evidence
+    evidence = {}
+    if vectorstore is not None:
+        evidence = get_evidence(vectorstore, sm["matched"] + sm["partial"])
+
+    # Step 4: LLM analysis
+    print("\n🤖 Generating analysis...")
+    data = generate_analysis(jd_text, skills, sm, llm)
+    print("✅ Done!")
+
+    return AnalysisResult(
+        match_score         = sm["score"],
+        matched_skills      = sm["matched"],
+        missing_skills      = sm["missing"],
+        partial_skills      = sm["partial"],
+        explanation         = data.get("explanation", ""),
+        resume_tips         = data.get("resume_tips", []),
+        cover_letter        = data.get("cover_letter", ""),
+        interview_questions = data.get("interview_questions", []),
+        evidence            = evidence,
+    )
