@@ -47,6 +47,7 @@ def get_llm():
     return ChatGroq(
         model="qwen/qwen3.8-27b",
         temperature=0.2,
+        max_tokens=1200,
         api_key=api_key,
     )
 
@@ -249,9 +250,11 @@ Return valid JSON only, without Markdown fences."""
 
     chain = prompt | llm | StrOutputParser()
 
+    
     raw = chain.invoke({
-        "jd": jd_text[:7000],
-    })
+        "jd": jd_text[:5000]
+})
+
 
     skills = _extract_json(raw, "[")
 
